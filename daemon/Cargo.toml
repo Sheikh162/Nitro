@@ -1,0 +1,13 @@
+[package]
+name = "nitro-daemon"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+nitro-core = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+sys-info = "0.9"
+ctrlc = "3.4"
+regex = "1.10"
+serde_json = { workspace = true }

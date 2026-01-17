@@ -1,3 +1,4 @@
+use crate::config::NitroConfig;
 use nitro_core::Profile;
 use std::process::Command;
 use std::thread;
@@ -6,43 +7,44 @@ use std::time::Duration;
 pub struct Actuator {
     last_profile: Option<Profile>,
     last_plugged_in: Option<bool>,
+    config: NitroConfig,
 }
 
 impl Actuator {
-    pub fn new() -> Self {
+    pub fn new(config: NitroConfig) -> Self {
         Self {
             last_profile: None,
             last_plugged_in: None,
+            config,
         }
     }
 
     pub fn apply_profile(&mut self, profile: &Profile, is_plugged_in: bool) {
-        // Safety First: If plugged in, do nothing (return early).
-        // We never restrict performance on AC power.
-        if is_plugged_in {
-            // Reset state tracking so when we unplug, we re-apply everything
-            self.last_plugged_in = Some(true);
-            return;
-        }
+        // If plugged in, IGNORE the dashboard profile and FORCE "Pro" limits.
+        // This ensures that plugging in always uncaps the performance,
+        // even if the dashboard was left on "Monk".
+        let target_profile = if is_plugged_in {
+            &Profile::Pro
+        } else {
+            profile
+        };
 
-        // Check if state changed to avoid spamming commands
-        // let profile_changed = self.last_profile.as_ref() != Some(profile);
-        // let power_source_changed = self.last_plugged_in != Some(is_plugged_in);
+        // Log the action
+        log::info!("Enforcing limits for {:?}", target_profile);
 
-        // if !profile_changed && !power_source_changed {
-        //     return;
-        // }
+        // 1. Apply the limits IMMEDIATELY (Every single loop)
+        // This is what fights the BIOS watchdog.
+        self.apply_ryzen_limits(target_profile);
 
-        // Apply Ryzen Limits
-        // Force Apply: if unplugged, run twice
-        println!("Enforcing limits...");
-        self.apply_ryzen_limits(profile);
-        if !is_plugged_in {
+        // 2. Double-Tap on Unplug:
+        // If we just unplugged (AC -> Battery), wait a tiny bit and apply AGAIN.
+        // This ensures the transition sticks if the hardware was busy switching states.
+        if !is_plugged_in && self.last_plugged_in == Some(true) {
             thread::sleep(Duration::from_millis(100));
-            self.apply_ryzen_limits(profile);
+            self.apply_ryzen_limits(target_profile);
         }
 
-        // Update state
+        // Update state tracking
         self.last_profile = Some(profile.clone());
         self.last_plugged_in = Some(is_plugged_in);
     }
@@ -52,37 +54,39 @@ impl Actuator {
 
         match profile {
             Profile::Monk => {
-                args.push("--stapm-limit=5000".to_string());
-                args.push("--fast-limit=8000".to_string());
-                args.push("--slow-limit=5000".to_string());
+                args.push(format!("--slow-limit={}", self.config.monk.slow_limit));
+                args.push(format!("--fast-limit={}", self.config.monk.fast_limit));
+                args.push(format!("--stapm-limit={}", self.config.monk.stapm_limit));
             }
             Profile::Eco => {
-                args.push("--stapm-limit=8000".to_string());
-                args.push("--fast-limit=15000".to_string());
-                args.push("--slow-limit=8000".to_string());
-                args.push("--tctl-temp=85".to_string());
+                args.push(format!("--slow-limit={}", self.config.eco.slow_limit));
+                args.push(format!("--fast-limit={}", self.config.eco.fast_limit));
+                args.push(format!("--stapm-limit={}", self.config.eco.stapm_limit));
+                if let Some(temp) = self.config.eco.tctl_temp {
+                    args.push(format!("--tctl-temp={}", temp));
+                }
             }
             Profile::Pro => {
-                args.push("--stapm-limit=25000".to_string());
-                args.push("--fast-limit=35000".to_string());
-                args.push("--slow-limit=25000".to_string());
+                args.push(format!("--slow-limit={}", self.config.pro.slow_limit));
+                args.push(format!("--fast-limit={}", self.config.pro.fast_limit));
+                args.push(format!("--stapm-limit={}", self.config.pro.stapm_limit));
             }
         };
 
         // Log what we are doing
-        println!("Applying Ryzen Limits: {:?}", args);
+        log::info!("Applying Ryzen Limits: {:?}", args);
 
         match Command::new("ryzenadj").args(&args).output() {
             Ok(output) => {
                 if !output.status.success() {
-                    eprintln!(
+                    log::error!(
                         "ryzenadj failed: {}",
                         String::from_utf8_lossy(&output.stderr)
                     );
                 }
             }
             Err(e) => {
-                eprintln!("Failed to execute ryzenadj: {}", e);
+                log::error!("Failed to execute ryzenadj: {}", e);
             }
         }
     }

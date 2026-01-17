@@ -10,6 +10,7 @@ pub enum Profile {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PowerState {
     pub battery_watts: f32,
+    pub cpu_watts: f32,
     pub battery_percent: u8,
     pub cpu_load: f32,
     pub profile: Profile,

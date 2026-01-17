@@ -82,6 +82,7 @@ async fn main() -> Result<()> {
     // App Loop
     let mut state = PowerState {
         battery_watts: 0.0,
+        cpu_watts: 0.0,
         battery_percent: 0,
         cpu_load: 0.0,
         profile: Profile::Eco,
@@ -123,18 +124,38 @@ async fn main() -> Result<()> {
             f.render_widget(gauge, chunks[0]);
 
             // 2. Wattage
+            // 2. Wattage
             let watt_text = if state.is_plugged_in {
-                "CHARGING".to_string()
+                vec![Span::styled(
+                    "CHARGING",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                        .add_modifier(Modifier::ITALIC),
+                )]
             } else {
-                format!("{:.1} W", state.battery_watts)
+                vec![
+                    Span::styled(
+                        format!("TOTAL: {:.1} W", state.battery_watts),
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("\n"),
+                    Span::styled(
+                        format!("CPU:   {:.1} W", state.cpu_watts),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]
             };
 
-            let paragraph = Paragraph::new(Span::styled(
-                watt_text,
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD)
-                    .add_modifier(Modifier::ITALIC), // Make it big/distinct
+            let paragraph = Paragraph::new(ratatui::text::Text::from(
+                watt_text
+                    .into_iter()
+                    .map(ratatui::text::Line::from)
+                    .collect::<Vec<_>>(),
             ))
             .block(Block::default().title("Power Draw").borders(Borders::ALL))
             .alignment(ratatui::layout::Alignment::Center);

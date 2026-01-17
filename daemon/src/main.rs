@@ -1,7 +1,11 @@
 use anyhow::Result;
 mod actuator;
+mod config;
+use config::NitroConfig;
 use nitro_core::{DaemonCommand, PowerState, Profile};
+use regex::Regex;
 use std::fs;
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -12,14 +16,16 @@ use tokio::time;
 async fn run_loop(
     tx: watch::Sender<PowerState>,
     shared_profile: Arc<Mutex<Profile>>,
+    config: NitroConfig,
 ) -> Result<()> {
     let mut interval = time::interval(Duration::from_secs(2));
-    let mut actuator = actuator::Actuator::new();
+    let mut actuator = actuator::Actuator::new(config);
 
     loop {
         interval.tick().await;
 
         let battery_watts = read_watts();
+        let cpu_watts = read_cpu_watts();
         let cpu_load = read_cpu_load();
         let battery_percent = read_battery_percent();
         let is_plugged_in = read_is_plugged_in();
@@ -35,6 +41,7 @@ async fn run_loop(
 
         let state = PowerState {
             battery_watts,
+            cpu_watts,
             battery_percent,
             cpu_load,
             profile: current_profile,
@@ -43,7 +50,7 @@ async fn run_loop(
             is_plugged_in,
         };
 
-        // println!("{:?}", state); // Optional: keep logging or remove it
+        // log::info!("{:?}", state); // Optional: keep logging or remove it
         let _ = tx.send(state);
     }
 }
@@ -64,7 +71,7 @@ async fn start_ipc_server(
     perms.set_mode(0o777); // Allow everyone to read/write
     std::fs::set_permissions(socket_path, perms).unwrap();
 
-    println!("IPC Server listening on {}", socket_path);
+    log::info!("IPC Server listening on {}", socket_path);
 
     loop {
         let (socket, _) = listener.accept().await?;
@@ -110,17 +117,17 @@ async fn start_ipc_server(
                 let mut lines = BufReader::new(reader).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     if let Ok(cmd) = serde_json::from_str::<DaemonCommand>(&line) {
-                        println!("Received Command: {:?}", cmd);
+                        log::info!("Received Command: {:?}", cmd);
                         match cmd {
                             DaemonCommand::SetProfile(p) => {
                                 let mut lock = shared_profile.lock().unwrap();
                                 *lock = p;
                             }
                             DaemonCommand::ToggleWifi => {
-                                println!("Toggle Wifi (Not Implemented)");
+                                log::info!("Toggle Wifi (Not Implemented)");
                             }
                             DaemonCommand::ToggleBluetooth => {
-                                println!("Toggle Bluetooth (Not Implemented)");
+                                log::info!("Toggle Bluetooth (Not Implemented)");
                             }
                         }
                     }
@@ -138,7 +145,32 @@ async fn start_ipc_server(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    println!("Starting Nitro Daemon...");
+    env_logger::init();
+    log::info!("Starting Nitro Daemon...");
+
+    // Load Config
+    let config = NitroConfig::load().unwrap_or_else(|e| {
+        log::warn!("Failed to load config, using defaults: {}", e);
+        // We need a way to get default config if load fails, but load() returns Result.
+        // For now, let's just panic or handle it better.
+        // Actually, load() handles defaults if file missing, but if file exists and is bad, it errors.
+        // Let's just assume defaults if it fails for now, or re-call load with no file?
+        // Simpler: Just panic if config is bad, or use a default struct.
+        // Since we don't have a Default impl for NitroConfig easily accessible here without deriving it,
+        // let's just unwrap for now as per instructions "If not found, returns a Default configuration".
+        // My load() implementation does that. So unwrap is fine if it returns defaults on missing file.
+        // If it errors on bad file, we probably want to crash to alert user.
+        NitroConfig::load().expect("Failed to load configuration")
+    });
+
+    // Graceful Exit Handler
+    let config_clone = config.clone();
+    ctrlc::set_handler(move || {
+        log::info!("Exiting... Resetting to Pro Mode.");
+        let mut actuator = actuator::Actuator::new(config_clone.clone());
+        actuator.apply_profile(&Profile::Pro, false); // Force apply Pro mode (unplugged logic to ensure it runs)
+        std::process::exit(0);
+    })?;
 
     // Shared State
     let shared_profile = Arc::new(Mutex::new(Profile::Eco));
@@ -146,6 +178,7 @@ async fn main() -> Result<()> {
     // Initial state
     let initial_state = PowerState {
         battery_watts: 0.0,
+        cpu_watts: 0.0,
         battery_percent: 0,
         cpu_load: 0.0,
         profile: Profile::Eco,
@@ -160,12 +193,12 @@ async fn main() -> Result<()> {
     let profile_for_server = shared_profile.clone();
     tokio::spawn(async move {
         if let Err(e) = start_ipc_server(rx, profile_for_server).await {
-            eprintln!("IPC Server Error: {}", e);
+            log::error!("IPC Server Error: {}", e);
         }
     });
 
     // Run Sensor Loop
-    run_loop(tx, shared_profile).await
+    run_loop(tx, shared_profile, config).await
 }
 
 fn read_watts() -> f32 {
@@ -218,6 +251,29 @@ fn read_cpu_load() -> f32 {
         Ok(load) => load.one as f32, // Using 1-minute load average as a proxy for "current" load
         Err(_) => 0.0,
     }
+}
+
+fn read_cpu_watts() -> f32 {
+    // Run ryzenadj -i
+    if let Ok(output) = Command::new("ryzenadj").arg("-i").output() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // Regex to find "PPT LIMIT FAST" or similar? No, user said "PPT VALUE FAST"
+        // Actually usually it's "PPT VALUE FAST" or just "PPT VALUE".
+        // Let's look for the table output.
+        // Example output:
+        // | PPT LIMIT FAST | 35.000 |
+        // | PPT VALUE FAST | 12.345 |
+        // We want the value.
+        let re = Regex::new(r"PPT VALUE FAST\s*\|\s*([\d\.]+)").unwrap();
+        if let Some(caps) = re.captures(&stdout) {
+            if let Some(val_str) = caps.get(1) {
+                if let Ok(val) = val_str.as_str().parse::<f32>() {
+                    return val;
+                }
+            }
+        }
+    }
+    0.0
 }
 
 // Helpers for other fields to make the struct more realistic
